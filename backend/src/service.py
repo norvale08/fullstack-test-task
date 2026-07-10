@@ -1,42 +1,36 @@
 import mimetypes
-import os
 from pathlib import Path
-from uuid import uuid4
 
 from fastapi import HTTPException, UploadFile, status
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
+from src.config import settings
+from src.database import async_session_maker
 from src.models import Alert, StoredFile
+from src.repositories import AlertRepository, FileRepository
+from src.services.file_scanner import FileScannerService
+from src.services.file_storage import FileStorageService
 
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-STORAGE_DIR = BASE_DIR / "storage" / "files"
-STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-DB_URL = (
-    f"postgresql+asyncpg://{os.environ.get('POSTGRES_USER')}:"
-    f"{os.environ.get('POSTGRES_PASSWORD')}@{os.environ.get('POSTGRES_HOST')}:"
-    f"{os.environ.get('PGPORT')}/{os.environ.get('POSTGRES_DB')}"
-)
-engine = create_async_engine(DB_URL)
-async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
+# Initialize services
+storage_service = FileStorageService()
+scanner_service = FileScannerService()
 
 
 async def list_files() -> list[StoredFile]:
     async with async_session_maker() as session:
-        result = await session.execute(select(StoredFile).order_by(StoredFile.created_at.desc()))
-        return list(result.scalars().all())
+        repo = FileRepository(session)
+        return await repo.get_all()
 
 
 async def list_alerts() -> list[Alert]:
     async with async_session_maker() as session:
-        result = await session.execute(select(Alert).order_by(Alert.created_at.desc()))
-        return list(result.scalars().all())
+        repo = AlertRepository(session)
+        return await repo.get_all()
 
 
 async def get_file(file_id: str) -> StoredFile:
     async with async_session_maker() as session:
-        file_item = await session.get(StoredFile, file_id)
+        repo = FileRepository(session)
+        file_item = await repo.get_by_id(file_id)
         if not file_item:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
         return file_item
@@ -47,55 +41,53 @@ async def create_file(title: str, upload_file: UploadFile) -> StoredFile:
     if not content:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File is empty")
 
-    file_id = str(uuid4())
-    suffix = Path(upload_file.filename or "").suffix
-    stored_name = f"{file_id}{suffix}"
-    stored_path = STORAGE_DIR / stored_name
-    stored_path.write_bytes(content)
+    stored_name = storage_service.generate_filename(upload_file.filename or "")
+    await storage_service.save_file(content, stored_name)
+
+    mime_type = (
+        upload_file.content_type
+        or mimetypes.guess_type(stored_name)[0]
+        or "application/octet-stream"
+    )
 
     file_item = StoredFile(
-        id=file_id,
+        id=Path(stored_name).stem,
         title=title,
         original_name=upload_file.filename or stored_name,
         stored_name=stored_name,
-        mime_type=upload_file.content_type or mimetypes.guess_type(stored_name)[0] or "application/octet-stream",
+        mime_type=mime_type,
         size=len(content),
         processing_status="uploaded",
     )
     async with async_session_maker() as session:
-        session.add(file_item)
-        await session.commit()
-        await session.refresh(file_item)
-    return file_item
+        repo = FileRepository(session)
+        return await repo.create(file_item)
 
 
 async def update_file(file_id: str, title: str) -> StoredFile:
     async with async_session_maker() as session:
-        file_item = await session.get(StoredFile, file_id)
+        repo = FileRepository(session)
+        file_item = await repo.get_by_id(file_id)
         if not file_item:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
         file_item.title = title
-        await session.commit()
-        await session.refresh(file_item)
-        return file_item
+        return await repo.update(file_item)
 
 
 async def delete_file(file_id: str) -> None:
     async with async_session_maker() as session:
-        file_item = await session.get(StoredFile, file_id)
+        repo = FileRepository(session)
+        file_item = await repo.get_by_id(file_id)
         if not file_item:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
-        stored_path = STORAGE_DIR / file_item.stored_name
-        if stored_path.exists():
-            stored_path.unlink()
-        await session.delete(file_item)
-        await session.commit()
+        await storage_service.delete_file(file_item.stored_name)
+        await repo.delete(file_item)
 
 
 async def get_file_path(file_id: str) -> tuple[StoredFile, Path]:
     file_item = await get_file(file_id)
-    stored_path = STORAGE_DIR / file_item.stored_name
-    if not stored_path.exists():
+    stored_path = storage_service.get_file_path(file_item.stored_name)
+    if not storage_service.file_exists(file_item.stored_name):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stored file not found")
     return file_item, stored_path
 
@@ -103,7 +95,5 @@ async def get_file_path(file_id: str) -> tuple[StoredFile, Path]:
 async def create_alert(file_id: str, level: str, message: str) -> Alert:
     alert = Alert(file_id=file_id, level=level, message=message)
     async with async_session_maker() as session:
-        session.add(alert)
-        await session.commit()
-        await session.refresh(alert)
-        return alert
+        repo = AlertRepository(session)
+        return await repo.create(alert)
